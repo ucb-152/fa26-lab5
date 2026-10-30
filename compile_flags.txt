@@ -1,0 +1,12 @@
+-xc
+-std=c11
+-Iinclude
+-Iapp
+-O2
+-g
+-Wall
+-Wextra
+-Wpedantic
+-mcpu=neoverse-v1
+-pthread
+-fopenmp

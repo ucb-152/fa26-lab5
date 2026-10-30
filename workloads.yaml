@@ -1,0 +1,28 @@
+# make benchmark uses directed unless WORKLOAD names another preset.
+# Each entry generates a deterministic grayscale image; dimensions are in pixels.
+presets:
+  directed:
+    - {pattern: curves, width: 1024, height: 1024}
+    - {pattern: curves, width: 2048, height: 2048}
+    - {pattern: texture, width: 2048, height: 2048}
+  quick:
+    - {pattern: curves, width: 1024, height: 1024}
+  texture:
+    - {pattern: texture, width: 2048, height: 2048}
+  vertical:
+    - {pattern: vertical-curves, width: 2048, height: 2048}
+  straight:
+    - {pattern: straight, width: 2048, height: 2048}
+  varied:
+    - {pattern: shapes, width: 1536, height: 1024}
+    - {pattern: vertical-curves, width: 1025, height: 769}
+    - {pattern: texture, width: 769, height: 513}
+    - {pattern: straight, width: 2048, height: 512}
+  borders:
+    - {pattern: shapes, width: 5, height: 5}
+    - {pattern: texture, width: 37, height: 29}
+    - {pattern: curves, width: 513, height: 257}
+  large:
+    - {pattern: curves, width: 4096, height: 2048}
+    - {pattern: texture, width: 2048, height: 3072}
+    - {pattern: shapes, width: 3072, height: 2048}
