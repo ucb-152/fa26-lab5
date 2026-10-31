@@ -10,16 +10,17 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 
-from compare_results import compare
+from check import compare
 from generate_image import generate
 
-PROFILE_RUNS = 40
 PROFILE_SECONDS = 10
+STARTER_REPOSITORY = "https://github.com/ucb-152/fa26-lab5"
 
 PATTERNS = {"curves", "vertical-curves", "straight", "shapes", "texture"}
-SOURCE_ITEMS = ("src", "include", "app", "tests", "scripts", "examples", "Makefile", "workloads.yaml")
+SOURCE_ITEMS = ("src", "include", "app", "scripts", "examples", "Makefile", "workloads.yaml")
 
 
 def select_workloads(root, preset, input_path):
@@ -90,7 +91,7 @@ def extra_versions(previous, requested):
             raise ValueError("COMPARE must be comma-separated positive experiment numbers, e.g. COMPARE=002,005.")
         version = available.get(int(token))
         if version is None:
-            raise ValueError(f"COMPARE experiment {token} is not a successful saved experiment.")
+            raise ValueError(f"COMPARE experiment {token} is not a successful experiment.")
         if version not in selected:
             selected.append(version)
     return selected
@@ -103,6 +104,19 @@ def run_logged(command, log, cwd=None, env=None):
     if result.returncode:
         raise ValueError(f"Command failed (exit {result.returncode}). See {log}")
     return result.stdout
+
+
+def prepare_starter(experiments, command, environment):
+    starter = experiments / "starter"
+    starter.mkdir(exist_ok=True)
+    source = starter / "source"
+    if not source.exists():
+        with tempfile.TemporaryDirectory(prefix=".starter-", dir=experiments) as temporary:
+            checkout = Path(temporary) / "source"
+            run_logged(["git", "clone", "--depth", "1", STARTER_REPOSITORY, checkout],
+                       starter / "clone.log", env=environment)
+            checkout.rename(source)
+    run_logged(command, starter / "build.log", source, environment)
 
 
 def parse_timings(output):
@@ -126,8 +140,67 @@ def parse_timings(output):
     return stages
 
 
-def collect_profile(experiment, name):
-    """Record one fixed workload batch, then generate its APerf report."""
+def format_table(headers, rows, left_columns=1):
+    """Align plain-text tables without depending on terminal escape sequences."""
+    widths = [max(len(row[i]) for row in [headers, *rows]) for i in range(len(headers))]
+
+    def line(row):
+        return "  ".join(value.ljust(width) if i < left_columns else value.rjust(width)
+                         for i, (value, width) in enumerate(zip(row, widths))).rstrip()
+
+    return "\n".join([line(headers), *(line(row) for row in rows)])
+
+
+def speedup(before, after):
+    return f"{before / after:.3f}x" if after > 0 else "n/a"
+
+
+def workload_report(timings, versions, runs):
+    """Put the overall comparison before the current version's stage breakdown."""
+    current = timings["current"]
+    after = current["total"]["mean"]
+    references = len(timings) > 1
+    headers = ["Version", "Exp.", "Mean (ms)" if runs > 1 else "Time (ms)", "SD (ms)"]
+    if references:
+        headers += ["Current speedup"]
+    rows = []
+    for label, stages in timings.items():
+        total = stages["total"]
+        row = [label, "-" if label == "starter" else versions[label].name, f"{total['mean'] * 1000:.3f}",
+               f"{total['stdev'] * 1000:.3f}" if runs > 1 else "-"]
+        if references:
+            row += [speedup(total["mean"], after) if label != "current" else "-"]
+        rows.append(row)
+    sections = ["Total kernel time", format_table(headers, rows, left_columns=2)]
+
+    rows = []
+    for stage, stats in current.items():
+        if stage == "total":
+            continue
+        share = f"{stats['mean'] / after:.1%}" if after > 0 else "n/a"
+        rows.append([stage, f"{stats['mean'] * 1000:.3f}",
+                     f"{stats['stdev'] * 1000:.3f}" if runs > 1 else "-", share])
+    sections += ["", "Current stage breakdown",
+                 format_table(["Stage", headers[2], "SD (ms)", "% of total"], rows)]
+    return "\n".join(sections)
+
+
+def summary_report(all_timings, versions, runs):
+    references = [label for label in versions if label != "current"]
+    headers = ["Workload", "Mean (ms)" if runs > 1 else "Time (ms)", "SD (ms)"]
+    headers += [f"vs {versions[label].name}" for label in references]
+    rows = []
+    for name, timings in all_timings.items():
+        total = timings["current"]["total"]
+        rows.append([name, f"{total['mean'] * 1000:.3f}",
+                     f"{total['stdev'] * 1000:.3f}" if runs > 1 else "-",
+                     *(speedup(timings[label]["total"]["mean"], total["mean"])
+                       for label in references)])
+    return format_table(headers, rows)
+
+
+def collect_profile(experiment, name, runs):
+    """Record a workload batch with the timing run count, then generate its APerf report."""
     folder = experiment / "profiles" / name
     folder.mkdir(parents=True)
     with (folder / "record.log").open("w") as log:
@@ -136,7 +209,7 @@ def collect_profile(experiment, name):
              "-p", str(PROFILE_SECONDS), "--profile"],
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         try:
-            run_logged([experiment / "bin/pgm2svg", "--benchmark", PROFILE_RUNS,
+            run_logged([experiment / "bin/pgm2svg", "--benchmark", runs,
                         experiment / "inputs" / f"{name}.pgm", folder / "drawing"],
                        folder / "workload.log")
             if recorder.wait() != 0:
@@ -157,7 +230,11 @@ def collect_profile(experiment, name):
     return report
 
 
-def benchmark(root, workloads, runs=7, note="", preset="directed", profile=False, compare_versions=""):
+def benchmark(root, workloads, runs=None, note="", preset="quick", profile=False, compare_versions=""):
+    if runs is None:
+        runs = 40 if profile else 7
+    if runs < 1:
+        raise ValueError("RUNS must be a positive integer.")
     experiments = root / "experiments"
     experiments.mkdir(exist_ok=True)
     # A second invocation must not select the same ID or disturb measurements.
@@ -186,10 +263,18 @@ def benchmark(root, workloads, runs=7, note="", preset="directed", profile=False
             manifest.write_text(json.dumps(info, indent=2) + "\n")
 
         persist()
-        say(f"Experiment {current.name}: {current.relative_to(root)}")
+        versions = {"current": current, "starter": experiments / "starter"}
+        if previous:
+            versions["previous"] = previous[-1]
+        for version in extra:
+            if version not in versions.values():
+                versions[f"version-{version.name}"] = version
+
+        say(f"Experiment {current.name} ({runs} {'runs' if runs != 1 else 'run'})")
         if note:
             say(f"Note: {note}")
         try:
+            say("Preparing inputs...")
             save_source(root, current)
             inputs = current / "inputs"
             inputs.mkdir()
@@ -207,36 +292,25 @@ def benchmark(root, workloads, runs=7, note="", preset="directed", profile=False
             for key in ("CC", "CFLAGS", "CPPFLAGS", "LDFLAGS", "LDLIBS"):
                 if f"LAB_BENCH_{key}" in environment:
                     command.append(f"{key}={environment[f'LAB_BENCH_{key}']}")
-            command += ["../bin/pgm2svg", "../bin/dump_result", "../bin/test_edge_paths"]
+            command += ["../bin/pgm2svg", "../bin/test_pipeline"]
             info["build_command"] = command
             persist()
-            say("Building saved source and running tests...")
+            say("Building...")
             run_logged(command, current / "build.log", current / "source", environment)
-            for script, arguments in (("check_outputs", ["../bin"]),
-                                      ("test_results", ["../bin"]),
-                                      ("test_benchmark", [])):
-                run_logged([sys.executable, f"tests/{script}.py", *arguments],
-                           current / f"{script}.log", current / "source", environment)
-            versions = {"current": current}
-            if previous:
-                versions["starter"] = previous[0]
-                if previous[-1] != previous[0]:
-                    versions["previous"] = previous[-1]
-                say(f"Comparing with starter {previous[0].name} and previous {previous[-1].name}.")
-            else:
-                say("First successful run establishes the starter version. Run this before editing code.")
-            for version in extra:
-                if version not in versions.values():
-                    versions[f"version-{version.name}"] = version
-                    say(f"Also comparing with experiment {version.name}.")
+            prepare_starter(experiments, command, environment)
+            say("Running tests...")
+            run_logged([sys.executable, "scripts/check.py", "../bin"],
+                       current / "check.log", current / "source", environment)
             results = current / "results"
             results.mkdir()
             # Finish all correctness checks before collecting any timings.
             for item in workloads:
+                say(f"Checking {item['name']}...")
                 folder = results / item["name"]
                 folder.mkdir()
                 for label, version in versions.items():
-                    run_logged([version / "bin/dump_result", inputs / f"{item['name']}.pgm", folder / f"{label}.dump"],
+                    run_logged([version / "bin/test_pipeline", "--dump",
+                                inputs / f"{item['name']}.pgm", folder / f"{label}.dump"],
                                folder / f"{label}-check.txt")
                     if label != "current":
                         mismatch = compare(folder / "current.dump", folder / f"{label}.dump")
@@ -245,33 +319,33 @@ def benchmark(root, workloads, runs=7, note="", preset="directed", profile=False
                 # Keep the check result, not large transient binary dumps.
                 for dump in folder.glob("*.dump"):
                     dump.unlink()
-            say("Correctness checks passed.")
+            say("Checks passed.")
             info["comparisons"] = {label: version.name for label, version in versions.items()}
             info["timings"] = {}
             for item in workloads:
                 name = item["name"]
+                say(f"\n{name}")
                 folder = results / name
                 timings = {}
                 for label, version in versions.items():
+                    description = label if label == "starter" else f"{label} {version.name}"
+                    say(f"Benchmarking {description}...")
                     output = run_logged([version / "bin/pgm2svg", "--benchmark", runs,
                                          inputs / f"{name}.pgm", folder / label], folder / f"{label}-timings.txt")
                     timings[label] = parse_timings(output)
                 info["timings"][name] = timings
-                say(f"\n{name}: current stage timings\n{(folder / 'current-timings.txt').read_text().rstrip()}")
-                say("Version       Mean (ms)   Stdev (ms)   Speedup of current")
-                after = timings["current"]["total"]["mean"]
-                for label, stages in timings.items():
-                    total = stages["total"]
-                    speedup = f"{total['mean'] / after:.3f}x" if after > 0 and label != "current" else "—"
-                    say(f"{label:12} {total['mean'] * 1000:10.3f} {total['stdev'] * 1000:12.3f} {speedup:>20}")
+                say("\n" + workload_report(timings, versions, runs))
                 persist()
+            if len(workloads) > 1:
+                say("\nSummary")
+                say(summary_report(info["timings"], versions, runs))
             if profile:
-                info["profiling"] = {"runs": PROFILE_RUNS, "seconds": PROFILE_SECONDS, "status": "running"}
+                info["profiling"] = {"runs": runs, "seconds": PROFILE_SECONDS, "status": "running"}
                 persist()
-                say(f"\nCollecting APerf profiles ({PROFILE_RUNS} iterations per input)...")
                 try:
                     for item in workloads:
-                        report_path = collect_profile(current, item["name"])
+                        say(f"\nProfiling {item['name']}...")
+                        report_path = collect_profile(current, item["name"], runs)
                         say(f"APerf report: {report_path.relative_to(root)}")
                     info["profiling"]["status"] = "passed"
                 except (ValueError, OSError) as error:
@@ -279,15 +353,19 @@ def benchmark(root, workloads, runs=7, note="", preset="directed", profile=False
                     info["profiling"]["status"] = "failed"
                     info["profiling"]["error"] = str(error)
                     info["status"] = "passed"
-                    say(f"Profiling failed: {error}. Benchmark results are saved.")
                     raise
             info["status"] = "passed"
-            say(f"\nSaved source, executables, inputs, and results in {current.relative_to(root)}")
+            say(f"\nResults: {current.relative_to(root) / 'results.txt'}")
         except BaseException as error:
             if info.get("status") != "passed":
                 info["status"] = "failed"
             info["error"] = str(error) or type(error).__name__
-            say(f"FAILED: {info['error']}\nSaved attempt: {current.relative_to(root)}")
+            if info["status"] == "passed":
+                say(f"\nProfiling failed: {info['error']}")
+                say(f"Benchmark passed. Results: {current.relative_to(root) / 'results.txt'}")
+            else:
+                say(f"\nError: {info['error']}")
+                say(f"Failed experiment: {current.relative_to(root)}/")
             raise
         finally:
             persist()
@@ -297,10 +375,10 @@ def benchmark(root, workloads, runs=7, note="", preset="directed", profile=False
 def main():
     root = Path(__file__).resolve().parents[1]
     try:
-        runs = int(os.environ.get("LAB_BENCH_RUNS", "7"))
-        if runs < 1:
-            raise ValueError("RUNS must be a positive integer.")
-        preset = os.environ.get("LAB_BENCH_WORKLOAD", "directed")
+        runs = os.environ.get("LAB_BENCH_RUNS")
+        if runs is not None:
+            runs = int(runs)
+        preset = os.environ.get("LAB_BENCH_WORKLOAD", "quick")
         workloads = select_workloads(root, preset, os.environ.get("LAB_BENCH_INPUT", ""))
         profile = os.environ.get("LAB_BENCH_PROFILE", "0")
         if profile not in {"0", "1"}:

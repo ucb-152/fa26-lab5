@@ -4,11 +4,11 @@ CFLAGS ?= -std=c11 -O2 -g -Wall -Wextra -Wpedantic -mcpu=neoverse-v1 -pthread -f
 CPPFLAGS ?= -Iinclude -Iapp
 LDLIBS ?= -lm
 BUILD ?= bin
-WORKLOAD ?= directed
-RUNS ?= 7
+WORKLOAD ?= quick
+PROFILE ?= 0
+RUNS ?= $(if $(filter 1,$(PROFILE)),40,7)
 INPUT ?=
 NOTE ?=
-PROFILE ?= 0
 COMPARE ?=
 
 PIPELINE_SOURCES := $(shell find src -type f -name '*.c' | sort)
@@ -21,10 +21,7 @@ standalone: $(BUILD)/pgm2svg
 $(BUILD)/pgm2svg: $(PIPELINE_OBJECTS) $(IO_OBJECTS) $(BUILD)/app/main.o
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-$(BUILD)/dump_result: $(PIPELINE_OBJECTS) $(BUILD)/app/pgm.o $(BUILD)/tests/dump_result.o
-	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
-
-$(BUILD)/test_edge_paths: $(PIPELINE_OBJECTS) $(BUILD)/tests/test_edge_paths.o
+$(BUILD)/test_pipeline: $(PIPELINE_OBJECTS) $(BUILD)/app/pgm.o $(BUILD)/scripts/test_pipeline.o
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
 $(BUILD)/%.o: %.c
@@ -43,10 +40,10 @@ benchmark: export LAB_BENCH_CPPFLAGS = $(CPPFLAGS)
 benchmark: export LAB_BENCH_LDFLAGS = $(LDFLAGS)
 benchmark: export LAB_BENCH_LDLIBS = $(LDLIBS)
 benchmark:
-	$(PYTHON) scripts/benchmark.py
+	@$(PYTHON) scripts/benchmark.py
 
 clean:
 	rm -rf bin
 
 -include $(PIPELINE_OBJECTS:.o=.d) $(IO_OBJECTS:.o=.d)
--include $(BUILD)/app/main.d $(BUILD)/tests/test_edge_paths.d $(BUILD)/tests/dump_result.d
+-include $(BUILD)/app/main.d $(BUILD)/scripts/test_pipeline.d

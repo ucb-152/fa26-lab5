@@ -1,11 +1,57 @@
 #!/usr/bin/env python3
-"""Single test entry point: C unit checks and SVG output validation."""
+"""Pipeline correctness checks and complete-result comparison for make benchmark."""
 
+from itertools import zip_longest
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+
+
+def fields(path):
+    with path.open("rb") as stream:
+        if stream.read(8) != b"L5OUT001":
+            raise ValueError(f"Invalid result format: {path}")
+
+        def value():
+            data = stream.read(8)
+            if len(data) != 8:
+                raise ValueError(f"Truncated result: {path}")
+            return struct.unpack("<Q", data)[0]
+
+        sizes = {}
+        for name in ("width", "height", "edge_pixel_count", "path_count", "point_count", "vertex_count"):
+            sizes[name] = value()
+            yield name, sizes[name]
+        for i in range(sizes["edge_pixel_count"]):
+            for name in ("x", "y", "strength", "neighbor_mask", "visited_mask", "degree"):
+                yield f"edge_pixels[{i}].{name}", value()
+        for i in range(sizes["width"] * sizes["height"]):
+            yield f"pixel_to_edge[{i}]", value()
+        for i in range(sizes["path_count"]):
+            for name in ("first_point", "point_count", "closed", "retained", "first_vertex", "vertex_count"):
+                yield f"paths[{i}].{name}", value()
+        for name, count in (("point_ids", "point_count"), ("vertex_ids", "vertex_count")):
+            for i in range(sizes[count]):
+                yield f"{name}[{i}]", value()
+        if stream.read(1):
+            raise ValueError(f"Unexpected data after result: {path}")
+
+
+def compare(reference, modified):
+    left, right = fields(reference), fields(modified)
+    try:
+        for a, b in zip_longest(left, right):
+            if a != b:
+                if a and b and a[0] == b[0]:
+                    return f"Mismatch at {a[0]}: reference={a[1]}, modified={b[1]}"
+                return f"Result structure differs: reference={a}, modified={b}"
+    finally:
+        left.close()
+        right.close()
+    return None
 
 
 def fixtures():
@@ -71,7 +117,7 @@ def check_timings(result, count):
 
 def main():
     binaries = Path(sys.argv[1]).resolve()
-    run(binaries / "test_edge_paths")
+    run(binaries / "test_pipeline")
     namespace = {"svg": "http://www.w3.org/2000/svg"}
     with tempfile.TemporaryDirectory(prefix="edge-path-test-") as directory:
         temporary = Path(directory)

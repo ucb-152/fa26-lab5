@@ -1,4 +1,4 @@
-# make benchmark uses directed unless WORKLOAD names another preset.
+# make benchmark uses quick unless WORKLOAD names another preset.
 # Each entry generates a deterministic grayscale image; dimensions are in pixels.
 presets:
   directed:
